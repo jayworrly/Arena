@@ -13,7 +13,6 @@ class MarketDataUpdater:
         self.conn = None
         self.cur = None
         self._connect()
-        self._ensure_columns()
     
     def _connect(self):
         """Establish database connection"""

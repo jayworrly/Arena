@@ -63,229 +63,283 @@ class BondingTracker:
         except Exception as e:
             logging.error(f"Database connection error: {str(e)}")
             return None
-            
-    def _find_pair_creation_block(self, token_address, deployment_block, current_block):
-        """Find block where pair was created"""
-        try:
-            chunk_size = 2000
-            for start_block in range(deployment_block, current_block + 1, chunk_size):
-                end_block = min(start_block + chunk_size - 1, current_block)
-                
-                try:
-                    # Search for token as token0
-                    events1 = self.factory_contract.events.PairCreated.get_logs(
-                        fromBlock=start_block, toBlock=end_block,
-                        argument_filters={'token0': token_address}
-                    )
-                    
-                    # Search for token as token1  
-                    events2 = self.factory_contract.events.PairCreated.get_logs(
-                        fromBlock=start_block, toBlock=end_block,
-                        argument_filters={'token1': token_address}
-                    )
-                    
-                    # Find WAVAX pairs
-                    for event in events1 + events2:
-                        if (event['args']['token0'].lower() == WAVAX_ADDRESS.lower() or 
-                            event['args']['token1'].lower() == WAVAX_ADDRESS.lower()):
-                            return event['blockNumber']
-                except Exception:
-                    continue
-            return None
-        except Exception:
-            return None
-    
-    def _is_token_compatible(self, token_address):
-        """Check if token is compatible with standard interface"""
-        try:
-            contract = self.w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=TOKEN_ABI)
-            contract.functions.decimals().call()
-            return True
-        except Exception:
+
+    def _create_bonding_progress_table(self):
+        """Create bonding_progress table if it doesn't exist"""
+        conn = self._get_db_connection()
+        if not conn:
             return False
-    
-    def scan_pair_events(self, blocks_back=2000):
-        """Scan for recent PairCreated events and update bonding status"""
+            
+        with conn.cursor() as cur:
+            try:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bonding_progress (
+                        id SERIAL PRIMARY KEY,
+                        last_block_scanned BIGINT NOT NULL,
+                        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.commit()
+                return True
+            except Exception as e:
+                print(f"Error creating bonding_progress table: {str(e)}")
+                return False
+            finally:
+                conn.close()
+
+    def _get_latest_deployment_block(self):
+        """Get the latest block number from token_deployments table"""
+        conn = self._get_db_connection()
+        if not conn:
+            return None
+            
+        with conn.cursor() as cur:
+            try:
+                cur.execute("SELECT MAX(block_number) FROM token_deployments")
+                latest_block = cur.fetchone()[0]
+                return latest_block
+            except Exception as e:
+                print(f"Error getting latest deployment block: {str(e)}")
+                return None
+            finally:
+                conn.close()
+
+    def _manage_bonding_progress(self, block_number=None):
+        """Get or update last processed block for bonding tracking"""
+        # Ensure bonding_progress table exists
+        if not self._create_bonding_progress_table():
+            return None
+
+        conn = self._get_db_connection()
+        if not conn:
+            return None
+            
+        with conn.cursor() as cur:
+            try:
+                if block_number is None:  # Get last block
+                    cur.execute("SELECT last_block_scanned FROM bonding_progress ORDER BY id DESC LIMIT 1")
+                    result = cur.fetchone()
+                    if not result:
+                        # Get the latest block from token_deployments table
+                        latest_block = self._get_latest_deployment_block()
+                        if latest_block:
+                            cur.execute("INSERT INTO bonding_progress (last_block_scanned) VALUES (%s)", (latest_block,))
+                            conn.commit()
+                            return latest_block
+                        else:
+                            print("No token deployments found in database")
+                            return None
+                    return result[0]
+                else:  # Update last block
+                    cur.execute("""
+                        INSERT INTO bonding_progress (last_block_scanned) VALUES (%s)
+                        ON CONFLICT (id) DO UPDATE
+                        SET last_block_scanned = %s, last_updated = CURRENT_TIMESTAMP
+                    """, (block_number, block_number))
+                    conn.commit()
+                    return True
+            except Exception as e:
+                print(f"Error managing bonding progress: {str(e)}")
+                return None
+            finally:
+                conn.close()
+
+    def scan_for_bonding_events(self, batch_size=2000):
+        """Scan for PairCreated events and update bonding status"""
         try:
+            # Get the last processed block
+            last_processed_block = self._manage_bonding_progress()
+            if not last_processed_block:
+                print("Could not determine last processed block")
+                return False
+
             current_block = self.w3.eth.block_number
-            start_block = max(current_block - blocks_back, 0)
-            
-            print(f"Scanning blocks {start_block} to {current_block} for PairCreated events...")
-            
-            # Get PairCreated events
-            pair_events = self.factory_contract.events.PairCreated.get_logs(
-                fromBlock=start_block,
-                toBlock=current_block
-            )
-            
-            print(f"Found {len(pair_events)} PairCreated events")
-            
+            print(f"Scanning from block {last_processed_block} to {current_block} for bonding events...")
+
             conn = self._get_db_connection()
             if not conn:
                 return False
-                
+
             bonded_count = 0
-            try:
-                with conn.cursor() as cur:
-                    for event in pair_events:
-                        token0 = event['args']['token0']
-                        token1 = event['args']['token1']
-                        pair_address = event['args']['pair']
-                        block_number = event['blockNumber']
-                        
-                        # Check if either token is WAVAX (indicating a bonding event)
-                        bonded_token = None
-                        if token0.lower() == WAVAX_ADDRESS.lower():
-                            bonded_token = token1
-                        elif token1.lower() == WAVAX_ADDRESS.lower():
-                            bonded_token = token0
-                        
-                        if bonded_token:
-                            # Check if this token exists in our database
-                            cur.execute("""
-                                SELECT token_address FROM token_deployments 
-                                WHERE token_address = %s AND lp_deployed = FALSE
-                            """, (bonded_token,))
+            processed_blocks = last_processed_block
+
+            # Process in batches
+            for start_block in range(last_processed_block + 1, current_block + 1, batch_size):
+                end_block = min(start_block + batch_size - 1, current_block)
+                print(f"Processing blocks {start_block} to {end_block}...")
+
+                try:
+                    # Get PairCreated events
+                    pair_events = self.factory_contract.events.PairCreated.get_logs(
+                        fromBlock=start_block,
+                        toBlock=end_block
+                    )
+
+                    print(f"Found {len(pair_events)} PairCreated events in this batch")
+
+                    with conn.cursor() as cur:
+                        for event in pair_events:
+                            token0 = event['args']['token0']
+                            token1 = event['args']['token1']
+                            pair_address = event['args']['pair']
+                            block_number = event['blockNumber']
                             
-                            if cur.fetchone():
-                                # Update the token as bonded
-                                block = self.w3.eth.get_block(block_number)
-                                bonded_at = datetime.fromtimestamp(block['timestamp'])
-                                
+                            # Check if either token is WAVAX (indicating a bonding event)
+                            bonded_token = None
+                            if token0.lower() == WAVAX_ADDRESS.lower():
+                                bonded_token = token1
+                            elif token1.lower() == WAVAX_ADDRESS.lower():
+                                bonded_token = token0
+                            
+                            if bonded_token:
+                                # Check if this token exists in our database
                                 cur.execute("""
-                                    UPDATE token_deployments
-                                    SET lp_deployed = TRUE, pair_address = %s, bonded_at = %s,
-                                        bonded_block_number = %s, bonding_error = NULL
+                                    SELECT token_address FROM token_deployments 
                                     WHERE token_address = %s
-                                """, (pair_address, bonded_at, block_number, bonded_token))
+                                """, (bonded_token,))
                                 
-                                bonded_count += 1
-                                print(f"Found bonded token from events: {bonded_token}")
-                
-                conn.commit()
-                print(f"Event scan completed: {bonded_count} tokens updated from events")
-                
-            except Exception:
-                conn.rollback()
-            finally:
-                conn.close()
-                
+                                if cur.fetchone():
+                                    # Update the token as bonded
+                                    try:
+                                        block = self.w3.eth.get_block(block_number)
+                                        bonded_at = datetime.fromtimestamp(block['timestamp'])
+                                        
+                                        cur.execute("""
+                                            UPDATE token_deployments
+                                            SET lp_deployed = TRUE, pair_address = %s, bonded_at = %s,
+                                                bonded_block_number = %s
+                                            WHERE token_address = %s
+                                        """, (pair_address, bonded_at, block_number, bonded_token))
+                                        
+                                        print(f"Found bonded token: {bonded_token} with pair: {pair_address}")
+                                        bonded_count += 1
+                                    except Exception as e:
+                                        print(f"Error updating bonded token {bonded_token}: {str(e)}")
+                                        # Still count it even if update fails
+                                        bonded_count += 1
+                    
+                    conn.commit()
+                    processed_blocks = end_block
+                    
+                    # Update progress after each batch
+                    self._manage_bonding_progress(processed_blocks)
+                    
+                    # Small delay to avoid overwhelming the RPC
+                    time.sleep(0.1)
+                    
+                except Exception as e:
+                    print(f"Error processing batch {start_block}-{end_block}: {str(e)}")
+                    continue
+
+            conn.close()
+            print(f"Bonding scan completed: {bonded_count} newly bonded tokens found")
+            print(f"Processed up to block {processed_blocks}")
             return True
-                
-        except Exception:
-            print("Event scanning failed, falling back to individual checks")
+            
+        except Exception as e:
+            print(f"Error in scan_for_bonding_events: {str(e)}")
             return False
-    
-    def _check_bonding(self, token_address, deployment_block=None):
-        """Check if token is bonded and get bonding info"""
-        try:
-            if not self._is_token_compatible(token_address):
-                return {'is_bonded': False, 'pair_address': None, 'timestamp': None, 
-                       'block_number': None, 'error': 'Token not compatible'}
-            
-            pair_address = self.factory_contract.functions.getPair(token_address, WAVAX_ADDRESS).call()
-            
-            if pair_address == '0x0000000000000000000000000000000000000000':
-                return {'is_bonded': False, 'pair_address': None, 'timestamp': None,
-                       'block_number': None, 'error': None}
-            
-            current_block = self.w3.eth.block_number
-            creation_block = self._find_pair_creation_block(
-                token_address, deployment_block or 0, current_block
-            )
-            
-            if creation_block:
-                block = self.w3.eth.get_block(creation_block)
-                return {
-                    'is_bonded': True, 'pair_address': pair_address,
-                    'timestamp': datetime.fromtimestamp(block['timestamp']),
-                    'block_number': creation_block, 'error': None
-                }
-            else:
-                return {
-                    'is_bonded': True, 'pair_address': pair_address,
-                    'timestamp': None, 'block_number': None,
-                    'error': 'Could not determine bonding time'
-                }
-        except Exception:
-            return {'is_bonded': False, 'pair_address': None, 'timestamp': None,
-                   'block_number': None, 'error': 'Check failed'}
-    
-    def update_bonding_status(self, hours_back=24):
-        """Update bonding status for recently deployed tokens only"""
+
+    def check_unbonded_tokens(self, batch_size=100):
+        """Check tokens starting from the last processed block"""
         conn = self._get_db_connection()
         if not conn:
             return
             
         try:
             with conn.cursor() as cur:
-                # Only check tokens deployed in the last X hours
-                cur.execute("""
-                    SELECT token_address, block_number
-                    FROM token_deployments
-                    WHERE lp_deployed = FALSE 
-                    AND bonding_error IS NULL
-                    AND timestamp >= NOW() - INTERVAL '%s hours'
-                    ORDER BY block_number ASC
-                """, (hours_back,))
+                # Get the highest block number from our database (most recent token deployment)
+                cur.execute("SELECT MAX(block_number) FROM token_deployments")
+                max_block = cur.fetchone()[0]
+                if not max_block:
+                    print("No tokens found in database")
+                    return
                 
-                tokens = cur.fetchall()
-                print(f"Checking {len(tokens)} recently deployed tokens for bonding status...")
+                # Get count of all tokens in database
+                cur.execute("SELECT COUNT(*) FROM token_deployments")
+                total_tokens = cur.fetchone()[0]
+                
+                print(f"Checking {total_tokens} tokens starting from highest block {max_block} (working backwards)...")
                 
                 bonded_count = 0
-                for token_address, deployment_block in tokens:
-                    try:
-                        info = self._check_bonding(token_address, deployment_block)
-                        
-                        if info['is_bonded']:
-                            cur.execute("""
-                                UPDATE token_deployments
-                                SET lp_deployed = TRUE, pair_address = %s, bonded_at = %s,
-                                    bonded_block_number = %s, bonding_error = NULL
-                                WHERE token_address = %s
-                            """, (info['pair_address'], info['timestamp'], 
-                                 info['block_number'], token_address))
-                            bonded_count += 1
-                            print(f"Found bonded token: {token_address}")
-                        else:
-                            cur.execute("""
-                                UPDATE token_deployments SET bonding_error = %s
-                                WHERE token_address = %s
-                            """, (info['error'], token_address))
-                        
-                        conn.commit()
-                    except Exception:
-                        continue
+                processed_count = 0
                 
-                print(f"Completed: {bonded_count} newly bonded tokens found")
-        except Exception:
-            pass
+                # Process in batches, starting from the most recent
+                offset = 0
+                while offset < total_tokens:
+                    cur.execute("""
+                        SELECT token_address, block_number
+                        FROM token_deployments
+                        ORDER BY block_number DESC
+                        LIMIT %s OFFSET %s
+                    """, (batch_size, offset))
+                    
+                    tokens = cur.fetchall()
+                    if not tokens:
+                        break
+                    
+                    print(f"Processing batch {offset // batch_size + 1}: tokens {offset + 1} to {offset + len(tokens)} (blocks {tokens[-1][1]} to {tokens[0][1]})")
+                    
+                    for token_address, deployment_block in tokens:
+                        try:
+                            # Check if pair exists
+                            pair_address = self.factory_contract.functions.getPair(token_address, WAVAX_ADDRESS).call()
+                            
+                            if pair_address != '0x0000000000000000000000000000000000000000':
+                                # Token is bonded - update database
+                                try:
+                                    cur.execute("""
+                                        UPDATE token_deployments
+                                        SET lp_deployed = TRUE, pair_address = %s
+                                        WHERE token_address = %s
+                                    """, (pair_address, token_address))
+                                    conn.commit()
+                                    print(f"Found bonded token: {token_address} (block {deployment_block}) with pair: {pair_address}")
+                                    bonded_count += 1
+                                except Exception as e:
+                                    print(f"Error updating bonded token {token_address}: {str(e)}")
+                                    bonded_count += 1  # Still count it
+                            
+                            processed_count += 1
+                            
+                            # Rate limiting - small delay every 10 checks
+                            if processed_count % 10 == 0:
+                                time.sleep(0.1)
+                            
+                        except Exception as e:
+                            print(f"Error checking token {token_address}: {str(e)}")
+                            continue
+                    
+                    offset += batch_size
+                    
+                    # Progress update every batch
+                    print(f"Progress: {processed_count}/{total_tokens} tokens checked, {bonded_count} bonded tokens found")
+                
+                print(f"Individual check completed: {bonded_count} bonded tokens found out of {processed_count} total tokens")
+                
+        except Exception as e:
+            print(f"Error in check_unbonded_tokens: {str(e)}")
         finally:
             conn.close()
-    
-    def run(self, hours_back=24):
-        """Main execution method - uses efficient event scanning first"""
-        # First try the super efficient event scanning approach
-        if self.scan_pair_events():
-            print("Event scanning completed successfully")
+
+    def run(self):
+        """Main execution method"""
+        print("Starting bonding tracker...")
         
-        # Then check recently deployed tokens that might not have been caught
-        self.update_bonding_status(hours_back)
+        # First, scan for new bonding events from where we left off
+        if self.scan_for_bonding_events():
+            print("Event scanning completed successfully")
+        else:
+            print("Event scanning failed")
+        
+        # Then check some unbonded tokens individually
+        self.check_unbonded_tokens()
+        
         print("Bonding tracker completed")
 
 def main():
-    import sys
     tracker = BondingTracker()
-    
-    # Allow customizing how far back to check (default 24 hours)
-    hours_back = 24
-    if len(sys.argv) > 1:
-        try:
-            hours_back = int(sys.argv[1])
-        except:
-            pass
-    
-    tracker.run(hours_back)
+    tracker.run()
 
 if __name__ == "__main__":
     main()
